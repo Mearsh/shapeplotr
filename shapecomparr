@@ -1,0 +1,877 @@
+#!/usr/bin/env Rscript
+
+# Script to plot comparisons between SHAPE datasets
+# H. V. Mears
+
+# ==========
+# Preamble
+# ==========
+
+suppressPackageStartupMessages({
+  library(optparse)
+  library(tidyverse)
+  library(zoo)
+  library(patchwork)
+  library(scales)
+  library(ggforce)
+  library(ggbreak)
+  library(stringr)
+  library(data.table)
+  library(ggpointdensity)
+  library(viridis)
+})
+
+# ==========
+# Command Line Options
+# ==========
+
+option_list <- list(
+  make_option(c("-x", "--reactivity"), type = "character", help = "Input reactivity .wig file(s), comma-separated"),
+  make_option(c("-o", "--output"), type = "character", help = "Output PDF filename"),
+  make_option(c("-r", "--region"), type = "character", default = NULL, help = "Region to plot (format: start:end), e.g. '100:500'"),
+  make_option(c("--region_type"), type = "character", default = "aln", 
+              help = "Type of coordinates for region: 'aln' (alignment), 'ref' (reference), or 'query' [default: %default]"),
+  make_option(c("-g", "--groups"), type = "character", help = "Comma-separated group labels matching order of input files (e.g., Group1,Group1,Group2,Group2)"),
+  make_option(c("--seq_types"), type = "character", default = NULL, 
+              help = "Comma-separated sequence types matching order of input files (e.g., ref,ref,query,query). If not provided, all files treated as 'ref'"),
+  make_option(c("--limit_y"), action = "store_true", default = FALSE, help = "If set, limit reactivity y axis to 0-2.5"),
+  make_option(c("--smoothing"), action = "store_true", default = FALSE, help = "If set, apply smoothing to the reactivity data"),
+  make_option(c("--window"), type = "integer", default = 25, help = "Window size for smoothing [default: %default nt]"),
+  make_option(c("--median"), action = "store_true", default = FALSE, help = "If set, normalize data to the median reactivity"),
+  make_option(c("--colors"), type = "character", help = "Colors for reactivity and shannon entropy graphs, comma delimited"),
+  make_option(c("--compare_log"), action = "store_true", default = FALSE, help = "Use log scale in comparisons"),
+  make_option(c("--heatmap"), action = "store_true", default = FALSE, help = "If set, include a comparison heatmap below the scatter plot"),
+  make_option(c("--heatmap_thresholds"), type = "character", help = "Thresholds for heatmap categories (comma separated, e.g., 0,0.25,0.75)", default = "0,0.25,0.75"),
+  make_option(c("--alignment_file"), type = "character", default = NULL, help = "Optional alignment file mapping reference to query positions"),
+  make_option(c("--plot_profiles"), action = "store_true", default = FALSE, help = "If set, also plot reactivity profiles with positions shown in the specified coordinate system")
+)
+
+opt_parser <- OptionParser(option_list = option_list)
+opt <- parse_args(opt_parser)
+
+# ==========
+# Validation Functions
+# ==========
+
+validate_inputs <- function(opt) {
+  if (is.null(opt$region)) stop("ERROR: region of interest must be supplied as e.g. 1000:2400")
+  if (is.null(opt$output)) stop("ERROR: No output defined")
+  if (is.null(opt$reactivity)) stop("ERROR: No input data provided. Please specify reactivity .wig files")
+
+  if (file.exists(opt$output)) {
+    message("WARNING: Output file '", opt$output, "' exists and will be overwritten!")
+  }
+
+  if (!is.null(opt$reactivity)) {
+    message("Reactivity file specified: ", opt$reactivity)
+  }
+  
+  # Validate region_type option
+  if (!is.null(opt$region_type) && !opt$region_type %in% c("aln", "ref", "query")) {
+    stop("ERROR: region_type must be one of 'aln', 'ref', or 'query'")
+  }
+  
+  # Validate alignment file if specified
+  if (!is.null(opt$alignment_file)) {
+    if (!file.exists(opt$alignment_file)) {
+      stop("ERROR: Alignment file '", opt$alignment_file, "' does not exist")
+    }
+  }
+  
+  # Validate that alignment file is provided if region_type is not 'aln'
+  if (opt$region_type != "aln" && is.null(opt$alignment_file)) {
+    stop("ERROR: When region_type is '", opt$region_type, "', an alignment file must be provided")
+  }
+  
+  # Validate seq_types if provided
+  if (!is.null(opt$seq_types)) {
+    file_list <- trimws(unlist(strsplit(opt$reactivity, ",")))
+    seq_types <- trimws(unlist(strsplit(opt$seq_types, ",")))
+    
+    if (length(seq_types) != length(file_list)) {
+      stop("ERROR: Number of sequence types (", length(seq_types), 
+           ") must match number of input files (", length(file_list), ")")
+    }
+    
+    valid_types <- c("ref", "query")
+    if (!all(seq_types %in% valid_types)) {
+      invalid_types <- seq_types[!seq_types %in% valid_types]
+      stop("ERROR: Invalid sequence types: ", paste(invalid_types, collapse = ", "), 
+           ". Must be 'ref' or 'query'")
+    }
+  }
+  
+  # Check heatmap thresholds
+  if(opt$heatmap) {
+    thresholds <- as.numeric(strsplit(opt$heatmap_thresholds, ",")[[1]])
+    if(length(thresholds) != 3) {
+      stop("ERROR: Exactly three heatmap threshold values required (low, medium, high cutoffs)")
+    }
+    if(!all(diff(thresholds) > 0)) {
+      stop("ERROR: Heatmap thresholds must be in ascending order")
+    }
+  }
+}
+
+validate_groups <- function(group_string, file_list) {
+  group_labels <- trimws(unlist(strsplit(group_string, ",")))
+  
+  if (length(group_labels) != length(file_list)) {
+    stop("ERROR: Number of group labels (", length(group_labels), 
+         ") must match number of input files (", length(file_list), ")")
+  }
+  
+  unique_groups <- unique(group_labels)
+  if (length(unique_groups) != 2) {
+    stop("ERROR: Exactly two distinct group labels must be provided (you supplied: ", 
+         paste(unique_groups, collapse = ", "), ")")
+  }
+}
+
+parse_region <- function(region_text) {
+  coords <- as.integer(strsplit(region_text, ":")[[1]])
+  if (length(coords) != 2 || any(is.na(coords))) stop("Region format invalid. Use format like '100:500'")
+  list(start = coords[1], end = coords[2])
+}
+
+# ==========
+# Data Processing Functions
+# ==========
+
+read_wig <- function(file_path, sample_id = NULL) {
+  tryCatch({
+    wig_lines <- readLines(file_path)
+    data_lines <- wig_lines[!grepl("^track|^variableStep", wig_lines)]
+    wig_data <- read.table(text = data_lines, col.names = c("position", "value"))
+    wig_data$sample_id <- ifelse(is.null(sample_id), basename(file_path), sample_id)
+    return(wig_data)
+  }, error = function(e) {
+    stop("Error reading wig file: ", file_path, " - ", e$message)
+  })
+}
+
+parse_groups <- function(group_string, file_list) {
+  group_labels <- trimws(unlist(strsplit(group_string, ",")))
+  unique_groups <- unique(group_labels)
+  if (length(unique_groups) != 2) stop("Exactly two distinct group labels must be provided")
+  sample_ids <- paste0("replicate ", seq_along(file_list))
+  list(
+    group1 = sample_ids[group_labels == unique_groups[1]],
+    group2 = sample_ids[group_labels == unique_groups[2]],
+    group_labels = unique_groups
+  )
+}
+
+read_alignment_map <- function(path) {
+  tryCatch({
+    alignment <- fread(path)
+    required_cols <- c("aln_pos", "ref_pos", "query_pos")
+    if (!all(required_cols %in% colnames(alignment))) {
+      stop("Alignment file must have columns: aln_pos, ref_pos, and query_pos")
+    }
+    
+    # Validate alignment data
+    if (anyDuplicated(alignment$aln_pos)) {
+      warning("Alignment file contains duplicated alignment positions")
+    }
+    
+    # Check for NAs in critical columns
+    for (col in required_cols) {
+      na_count <- sum(is.na(alignment[[col]]))
+      if (na_count > 0) {
+        message(sprintf("Note: %d NA values found in %s column of alignment file", na_count, col))
+      }
+    }
+    
+    return(alignment)
+  }, error = function(e) {
+    stop("Failed to read alignment file: ", e$message)
+  })
+}
+
+apply_alignment <- function(reactivity_df, alignment_map, seq_type = c("ref", "query")) {
+  seq_type <- match.arg(seq_type)
+  
+  # Which column to join by
+  pos_col <- ifelse(seq_type == "ref", "ref_pos", "query_pos")
+  
+  # Keep track of positions before alignment
+  message(sprintf("Positions before alignment: %d", nrow(reactivity_df)))
+  
+  # Rename for joining
+  alignment_sub <- alignment_map[, .(aln_pos, pos = get(pos_col), ref_pos, query_pos)]
+  
+  # Join reactivity positions with alignment
+  reactivity_aligned <- merge(
+    reactivity_df,
+    alignment_sub,
+    by.x = "position",
+    by.y = "pos",
+    all.x = TRUE,   # keep all reactivity positions, even if no match (gap)
+    sort = FALSE
+  )
+  
+  # Count positions without alignment (gaps)
+  gap_count <- sum(is.na(reactivity_aligned$aln_pos))
+  if (gap_count > 0) {
+    message(sprintf("Note: %d positions have no alignment match (gaps)", gap_count))
+  }
+  
+  # Optional: remove positions that have NA aln_pos (positions with no alignment)
+  reactivity_aligned <- reactivity_aligned[!is.na(reactivity_aligned$aln_pos), ]
+  message(sprintf("Positions after alignment: %d", nrow(reactivity_aligned)))
+  
+  return(reactivity_aligned)
+}
+
+process_measurement_data <- function(file_paths, region_range, do_smoothing = FALSE, window_size = 25, 
+                                    do_median_normalize = FALSE, data_type = "reactivity", region_type = "aln") {
+  message(paste("Processing", data_type, "data"))
+  file_list <- trimws(unlist(strsplit(file_paths, ",")))
+  
+  # Get sequence types for each file
+  if (!is.null(opt$seq_types)) {
+    seq_types <- trimws(unlist(strsplit(opt$seq_types, ",")))
+  } else {
+    seq_types <- rep("ref", length(file_list))  # Default all to "ref"
+    message("No sequence types specified, treating all files as 'ref' type")
+  }
+  
+  # Read all files
+  data_combined <- bind_rows(
+    lapply(seq_along(file_list), function(idx) {
+      data <- read_wig(file_list[idx], sample_id = paste0("replicate ", idx))
+      data$seq_type <- seq_types[idx]  # Add sequence type information
+      return(data)
+    })
+  )
+
+  # Store position range for validation
+  original_min_pos <- min(data_combined$position, na.rm = TRUE)
+  original_max_pos <- max(data_combined$position, na.rm = TRUE)
+  message(sprintf("Original position range: %d-%d", original_min_pos, original_max_pos))
+  
+  # Check if requested region is within bounds
+  if (region_range$start < original_min_pos || region_range$end > original_max_pos) {
+    warning(sprintf("Requested region (%d:%d) extends beyond data range (%d:%d)",
+                    region_range$start, region_range$end, original_min_pos, original_max_pos))
+  }
+
+  # Create a copy of the original data
+  original_data <- data_combined
+
+  # Apply alignment if specified
+  if (!is.null(opt$alignment_file)) {
+    message("Applying alignment mapping from file: ", opt$alignment_file)
+    alignment_map <- read_alignment_map(opt$alignment_file)
+    
+    # Apply alignment separately for each sequence type
+    aligned_data_list <- list()
+    
+    for (seq_type in unique(data_combined$seq_type)) {
+      message(sprintf("Processing %s sequence type files", seq_type))
+      
+      # Filter data for this sequence type
+      seq_data <- data_combined[data_combined$seq_type == seq_type, ]
+      
+      if (nrow(seq_data) > 0) {
+        # Apply alignment for this sequence type
+        seq_aligned <- apply_alignment(seq_data, alignment_map, seq_type = seq_type)
+        
+        # Store position information
+        seq_aligned$original_position <- seq_aligned$position  # Original positions
+        seq_aligned$ref_position <- seq_aligned$ref_pos       # Reference positions from alignment
+        seq_aligned$query_position <- seq_aligned$query_pos   # Query positions from alignment
+        seq_aligned$aln_position <- seq_aligned$aln_pos       # Alignment positions
+        
+        aligned_data_list[[seq_type]] <- seq_aligned
+      }
+    }
+    
+    # Combine aligned data
+    data_combined <- bind_rows(aligned_data_list)
+    
+    # Set the position column based on region_type
+    if (region_type == "ref") {
+      message("Using reference positions for analysis")
+      data_combined$position <- data_combined$ref_position
+    } else if (region_type == "query") {
+      message("Using query positions for analysis")
+      data_combined$position <- data_combined$query_position
+    } else {
+      message("Using alignment positions for analysis")
+      data_combined$position <- data_combined$aln_position
+    }
+  }
+
+  if (do_median_normalize && nrow(data_combined) > 0) {
+    message("Normalizing to median...")
+    median_value <- median(data_combined$value, na.rm = TRUE)
+    data_combined$value <- data_combined$value / median_value
+  }
+
+  if (do_smoothing) {
+    message("Applying smoothing with window size ", window_size)
+    data_combined <- data_combined %>%
+      group_by(sample_id) %>%
+      arrange(position) %>%
+      mutate(smooth_value = zoo::rollmean(value, k = window_size, fill = NA, align = "center", partial = TRUE)) %>%
+      ungroup()
+    data_combined$value <- data_combined$smooth_value
+  }
+
+  # Filter based on the specified position type (based on region_type)
+  message(sprintf("Filtering to region %d:%d in %s coordinates", 
+                  region_range$start, region_range$end, region_type))
+  
+  data_summary <- data_combined %>%
+    group_by(sample_id, position) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    filter(position >= region_range$start & position <= region_range$end)
+  
+  if (nrow(data_summary) == 0) {
+    stop(sprintf("No data points remain after filtering to region %d:%d in %s coordinates. Check your region specification.",
+                region_range$start, region_range$end, region_type))
+  }
+  
+  message(sprintf("Retained %d data points after filtering", nrow(data_summary)))
+
+  return(list(
+    summary = data_summary,
+    full_data = data_combined,
+    original_data = original_data
+  ))
+}
+
+# ==========
+# Comparison Data Functions
+# ==========
+
+# Updated function to create complete position range and handle missing data
+create_complete_position_data <- function(data_summary, region_range) {
+  # Create a complete sequence of positions for the region
+  complete_positions <- data.frame(position = seq(region_range$start, region_range$end))
+  
+  # Get all unique sample IDs
+  sample_ids <- unique(data_summary$sample_id)
+  
+  # Create a complete grid of positions and samples
+  complete_grid <- expand.grid(
+    position = complete_positions$position,
+    sample_id = sample_ids,
+    stringsAsFactors = FALSE
+  )
+  
+  # Merge with actual data, keeping all positions
+  complete_data <- merge(complete_grid, data_summary, 
+                        by = c("position", "sample_id"), 
+                        all.x = TRUE)
+  
+  # Mark missing data explicitly
+  complete_data$has_data <- !is.na(complete_data$mean_value)
+  
+  return(complete_data)
+}
+
+# Comparison data generation function
+generate_comparison_data <- function(data_summary, group_assignments, region_range, compare_log = TRUE) {
+  group1_ids <- group_assignments$group1
+  group2_ids <- group_assignments$group2
+  group_labels <- group_assignments$group_labels
+
+  # Create complete position data
+  complete_data <- create_complete_position_data(data_summary, region_range)
+  
+  # Calculate group averages, preserving missing data information
+  group1_data <- complete_data %>%
+    filter(sample_id %in% group1_ids) %>%
+    group_by(position) %>%
+    summarise(
+      reactivity_1 = ifelse(all(is.na(mean_value)), NA, mean(mean_value, na.rm = TRUE)),
+      has_data_1 = any(!is.na(mean_value)),
+      .groups = "drop"
+    )
+
+  group2_data <- complete_data %>%
+    filter(sample_id %in% group2_ids) %>%
+    group_by(position) %>%
+    summarise(
+      reactivity_2 = ifelse(all(is.na(mean_value)), NA, mean(mean_value, na.rm = TRUE)),
+      has_data_2 = any(!is.na(mean_value)),
+      .groups = "drop"
+    )
+
+  # Merge the groups
+  comparisons <- merge(group1_data, group2_data, by = "position", all = TRUE)
+  comparisons$pair <- paste(paste(group1_ids, collapse = "+"), "vs", paste(group2_ids, collapse = "+"))
+  
+  # Prepare plot data
+  comparisons <- prepare_plot_data(comparisons, compare_log = compare_log)
+
+  return(comparisons)
+}
+
+prepare_plot_data <- function(comparisons, compare_log = TRUE) {
+  total_before <- nrow(comparisons)
+  if (compare_log) {
+    comparisons <- comparisons %>%
+      filter(reactivity_1 > 0, reactivity_2 > 0)
+    filtered_out <- total_before - nrow(comparisons)
+    if (filtered_out > 0) {
+      warning(filtered_out, " data points removed due to zero or negative reactivity values before log transformation.")
+    }
+    comparisons$reactivity_1_transformed <- log10(comparisons$reactivity_1)
+    comparisons$reactivity_2_transformed <- log10(comparisons$reactivity_2)
+  } else {
+    comparisons$reactivity_1_transformed <- comparisons$reactivity_1
+    comparisons$reactivity_2_transformed <- comparisons$reactivity_2
+  }
+  return(comparisons)
+}
+
+# ==========
+# Heatmap Functions
+# ==========
+
+# Function to categorize reactivity values
+categorize_reactivity <- function(data, has_data_flag, thresholds) {
+  # Ensure thresholds are numeric and sorted
+  thresholds <- sort(as.numeric(thresholds))
+  
+  # Initialize categories vector
+  categories <- rep(NA, length(data))
+  
+  # First, identify positions with no data
+  no_data_mask <- is.na(has_data_flag) | !has_data_flag | is.na(data)
+  categories[no_data_mask] <- "No data"
+  
+  # For positions with data, categorize based on thresholds
+  has_data_mask <- !no_data_mask
+  if (any(has_data_mask)) {
+    data_values <- data[has_data_mask]
+    
+    # Handle negative values by setting them to 0
+    data_values[data_values < 0] <- 0
+    
+    # Create breaks and labels
+    breaks <- c(-Inf, thresholds, Inf)
+    labels <- c("Zero", "Low", "Medium", "High")
+  
+    # Categorize the data
+    data_categories <- cut(data_values, 
+                          breaks = breaks,
+                          labels = labels,
+                          include.lowest = TRUE)
+    
+    categories[has_data_mask] <- as.character(data_categories)
+  }
+  
+  # Convert to factor with proper levels
+  all_levels <- c("No data", "Zero", "Low", "Medium", "High")
+  categories <- factor(categories, levels = all_levels)
+  
+  return(categories)
+}
+
+# Updated get_agreement function
+get_agreement <- function(cat1, cat2) {
+  # Convert factors to characters for easier comparison
+  cat1 <- as.character(cat1)
+  cat2 <- as.character(cat2)
+  
+  # Define agreement logic
+  agreement <- rep("Disagreement", length(cat1))
+  
+  # Both "No data"
+  agreement[cat1 == "No data" & cat2 == "No data"] <- "No data"
+  
+  # One has data, one doesn't
+  agreement[(cat1 == "No data" & cat2 != "No data") | 
+            (cat1 != "No data" & cat2 == "No data")] <- "Partial data"
+  
+  # Both have zero reactivity
+  agreement[cat1 == "Zero" & cat2 == "Zero"] <- "Agreement (zero)"
+
+  # Both have low reactivity
+  agreement[cat1 == "Low" & cat2 == "Low"] <- "Agreement (low)"
+  
+  # Both have high reactivity (Medium or High)
+  high_categories <- c("Medium", "High")
+  agreement[cat1 %in% high_categories & cat2 %in% high_categories] <- "Agreement (high)"
+  
+  return(agreement)
+}
+
+# Updated function to prepare heatmap data
+prepare_heatmap_data <- function(comparison_data, thresholds) {
+  thresholds <- as.numeric(strsplit(thresholds, ",")[[1]])
+  
+  # Categorize reactivity for both groups, using data availability flags
+  comparison_data$cat_group1 <- categorize_reactivity(
+    comparison_data$reactivity_1, 
+    comparison_data$has_data_1, 
+    thresholds
+  )
+  
+  comparison_data$cat_group2 <- categorize_reactivity(
+    comparison_data$reactivity_2, 
+    comparison_data$has_data_2, 
+    thresholds
+  )
+  
+  # Determine agreement
+  comparison_data$agreement <- get_agreement(comparison_data$cat_group1, comparison_data$cat_group2)
+  
+  return(comparison_data)
+}
+
+# Function to create a heatmap track
+create_heatmap_track <- function(data, column, title) {
+  # Define category colors
+  cat_colors <- c(
+    "No data" = "grey90",
+    "Zero" = "white",
+    "Low" = "#95CDF0",
+    "Medium" = "#6A96CF", 
+    "High" = "#426AB3"
+  )
+  
+  # Create the plot
+  p <- ggplot(data, aes(x = position, y = 1, fill = !!sym(column))) +
+    geom_tile() +
+    scale_fill_manual(values = cat_colors, drop = FALSE) +
+    labs(title = title, fill = "Category") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.title = element_text(size = 10, face = "bold"),
+      legend.position = "right",
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 0)
+    )
+  
+  return(p)
+}
+
+# Function to create agreement track
+create_agreement_track <- function(data) {
+  # Define agreement colors
+  agreement_colors <- c(
+    "No data" = "grey90",
+    "Partial data" = "grey70",
+    "Agreement (zero)" = "#BBDDAA",
+    "Agreement (low)" = "#86BE48",
+    "Agreement (high)" = "#6A953A",
+    "Disagreement" = "#B28ABF"
+  )
+  
+  # Create the plot
+  p <- ggplot(data, aes(x = position, y = 1, fill = agreement)) +
+    geom_tile() +
+    scale_fill_manual(values = agreement_colors, drop = FALSE) +
+    labs(title = "Agreement Track", fill = "Agreement") +
+    theme_minimal() +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.title = element_text(size = 10, face = "bold"),
+      legend.position = "right",
+      panel.grid = element_blank()
+    )
+  
+  return(p)
+}
+
+# Function to combine heatmap tracks into a single plot
+create_combined_heatmap <- function(heatmap_data, group_labels) {
+  # Create individual tracks
+  track1 <- create_heatmap_track(heatmap_data, "cat_group1", paste0(group_labels[1], " Reactivity"))
+  track2 <- create_heatmap_track(heatmap_data, "cat_group2", paste0(group_labels[2], " Reactivity"))
+  agreement_track <- create_agreement_track(heatmap_data)
+  
+  # Combine plots using patchwork
+  combined_plot <- track1 / track2 / agreement_track +
+    plot_layout(heights = c(1, 1, 1.2)) +
+    plot_annotation(
+      title = "SHAPE Reactivity Heatmap",
+      theme = theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+    )
+  
+  return(combined_plot)
+}
+
+# ==========
+# Plotting Functions
+# ==========
+
+create_comparison_plot <- function(comparison_data, region_range, data_type = "Reactivity", group_labels = NULL) {
+  message(paste("Creating pairwise", data_type, "comparison plot"))
+  label_prefix <- if (opt$compare_log) "Log " else ""
+
+  # Use unique group names for labeling
+  x_label <- paste(label_prefix, group_labels[1], data_type)
+  y_label <- paste(label_prefix, group_labels[2], data_type)
+
+  p <- ggplot(comparison_data, aes(x = reactivity_1_transformed, y = reactivity_2_transformed)) +
+    geom_pointdensity(size = 0.5, adjust = 0.2) +
+    geom_smooth(method = "lm", color = "black", se = FALSE, linewidth = 0.6) +
+    scale_color_viridis(option = "viridis") +
+    labs(
+      x = paste(x_label),
+      y = paste(y_label),
+      title = paste("Comparison of", data_type, "values"),
+      subtitle = paste0("Region: ", region_range$start, "-", region_range$end, 
+                        " (", opt$region_type, " coordinates)")
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.position = "none",
+      aspect.ratio = 1
+    )
+  return(p)
+}
+
+create_profile_plot <- function(data, region_range, group_assignments, region_type) {
+  message("Creating reactivity profile plot")
+  
+  # Extract full data with all position information
+  full_data <- data$full_data
+  
+  if (is.null(full_data)) {
+    warning("Full data not available for profile plotting")
+    return(NULL)
+  }
+  
+  # Prepare data for plotting
+  plot_data <- full_data %>%
+    group_by(sample_id, position) %>%
+    summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    filter(position >= region_range$start & position <= region_range$end)
+  
+  # Add group information
+  group1_ids <- group_assignments$group1
+  group2_ids <- group_assignments$group2
+  group_labels <- group_assignments$group_labels
+  
+  plot_data <- plot_data %>%
+    mutate(
+      group = case_when(
+        sample_id %in% group1_ids ~ group_labels[1],
+        sample_id %in% group2_ids ~ group_labels[2],
+        TRUE ~ "Unknown"
+      )
+    )
+  
+  # Create plot
+  p <- ggplot(plot_data, aes(x = position, y = value, color = group)) +
+    geom_line(aes(group = sample_id), alpha = 0.7) +
+    facet_wrap(~group, ncol = 1) +
+    labs(
+      x = paste("Position (", region_type, " coordinates)"),
+      y = "Reactivity",
+      title = "SHAPE Reactivity Profiles",
+      subtitle = paste0("Region: ", region_range$start, "-", region_range$end, 
+                        " (", region_type, " coordinates)")
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "lightgrey"),
+      strip.text = element_text(face = "bold")
+    )
+  
+  if (opt$limit_y) {
+    p <- p + ylim(0, 2.5)
+  }
+  
+  return(p)
+}
+
+save_regression_stats <- function(comparison_data, opt_output) {
+  message("Saving regression stats to a file")
+  regression_stats <- list()
+  for (pair_name in unique(comparison_data$pair)) {
+    pair_data <- subset(comparison_data, pair == pair_name)
+    lm_model <- lm(reactivity_2_transformed ~ reactivity_1_transformed, data = pair_data)
+    r_squared <- summary(lm_model)$r.squared
+    intercept <- coef(lm_model)[1]
+    slope <- coef(lm_model)[2]
+    pearson_cor <- cor(pair_data$reactivity_1_transformed, pair_data$reactivity_2_transformed, 
+                       method = "pearson", use = "pairwise.complete.obs")
+    spearman_cor <- cor(pair_data$reactivity_1_transformed, pair_data$reactivity_2_transformed, 
+                        method = "spearman", use = "pairwise.complete.obs")
+    slope_deviation_test <- abs(slope - 1) / summary(lm_model)$coefficients[2, 2]
+    slope_deviation_p_value <- 2 * pt(-abs(slope_deviation_test), df = lm_model$df.residual)
+    data_points <- nrow(pair_data)
+
+    regression_stats[[pair_name]] <- list(
+      R_squared = r_squared, 
+      Intercept = intercept,
+      Slope = slope, 
+      Pearson_correlation = pearson_cor,
+      Spearman_correlation = spearman_cor,
+      Slope_deviation_p_value = slope_deviation_p_value,
+      Number_of_data_points = data_points
+    )
+  }
+
+  base_output <- ifelse(grepl("\\.pdf$", opt_output, ignore.case = TRUE),
+                        sub("\\.pdf$", "", opt_output, ignore.case = TRUE),
+                        opt_output)
+  regression_file_name <- paste0(base_output, "_comparison_stats.txt")
+
+  write_lines <- c("Pairwise Linear Regression Stats:\n")
+  for (pair_name in names(regression_stats)) {
+    stats <- regression_stats[[pair_name]]
+    write_lines <- c(write_lines, paste(pair_name, ": R-squared =", round(stats$R_squared, 4),
+                                        ", Intercept =", round(stats$Intercept, 4),
+                                        ", Slope =", round(stats$Slope, 4),
+                                        ", Pearson correlation =", round(stats$Pearson_correlation, 4),
+                                        ", Spearman correlation =", round(stats$Spearman_correlation, 4),
+                                        ", Slope deviation p-value =", formatC(stats$Slope_deviation_p_value, format = "e", digits = 2),
+                                        ", Data points =", stats$Number_of_data_points))
+  }
+
+  writeLines(write_lines, regression_file_name)
+  message(paste("Regression stats saved to", regression_file_name))
+}
+
+# ==========
+# Main Execution
+# ==========
+
+main <- function() {
+  validate_inputs(opt)
+  region_range <- parse_region(opt$region)
+  message("Using region range: ", paste0(region_range$start, ":", region_range$end))
+
+  file_list <- trimws(unlist(strsplit(opt$reactivity, ",")))
+  validate_groups(opt$groups, file_list)
+  group_assignments <- parse_groups(opt$groups, file_list)
+
+  reactivity_data <- process_measurement_data(
+    file_paths = opt$reactivity,
+    region_range = region_range,
+    do_smoothing = opt$smoothing,
+    window_size = opt$window,
+    do_median_normalize = opt$median,
+    data_type = "reactivity",
+    region_type = opt$region_type
+  )
+  
+  # Extract the summary data for comparison
+  reactivity_summary <- reactivity_data$summary
+  
+  # FIXED: Added missing region_range parameter
+  comparison_data <- generate_comparison_data(
+    reactivity_summary,
+    group_assignments,
+    region_range,  # <- This was missing!
+    compare_log = opt$compare_log
+  )
+
+  comparison_plot <- create_comparison_plot(
+    comparison_data, 
+    region_range, 
+    data_type = "Reactivity", 
+    group_labels = group_assignments$group_labels
+  )
+
+  # Generate outputs
+  base_output <- ifelse(grepl("\\.pdf$", opt$output, ignore.case = TRUE),
+                        sub("\\.pdf$", "", opt$output, ignore.case = TRUE),
+                        opt$output)
+
+  # Create final plot with or without heatmap
+  if (opt$heatmap) {
+    message("INFO: Creating heatmap visualization")
+    
+    # Prepare heatmap data
+    heatmap_data <- prepare_heatmap_data(comparison_data, opt$heatmap_thresholds)
+    
+    # Create heatmap plot
+    heatmap_plot <- create_combined_heatmap(heatmap_data, group_assignments$group_labels)
+    
+    # Combine scatter plot and heatmap
+    final_plot <- comparison_plot / heatmap_plot + plot_layout(heights = c(3, 2))
+    
+    # Save combined plot
+    ggsave(
+      filename = paste0(base_output, "_comparisons.pdf"),
+      plot = final_plot,
+      width = 10,
+      height = 12
+    )
+    
+    # Also save standalone heatmap
+    ggsave(
+      filename = paste0(base_output, "_heatmap.pdf"),
+      plot = heatmap_plot,
+      width = 10,
+      height = 6
+    )
+    
+    message("INFO: Combined plot saved to ", paste0(base_output, "_comparisons.pdf"))
+    message("INFO: Standalone heatmap saved to ", paste0(base_output, "_heatmap.pdf"))
+    
+    # Save categorical data to CSV
+    heatmap_summary <- heatmap_data %>%
+      select(position, reactivity_1, reactivity_2, cat_group1, cat_group2, agreement) %>%
+      arrange(position)
+    
+    write.csv(heatmap_summary, 
+              file = paste0(base_output, "_heatmap_categories.csv"), 
+              row.names = FALSE)
+    
+    message("INFO: Heatmap category data saved to ", paste0(base_output, "_heatmap_categories.csv"))
+    
+  } else {
+    # Save scatter plot only
+    final_plot <- comparison_plot
+    
+    ggsave(
+      filename = paste0(base_output, "_comparisons.pdf"),
+      plot = final_plot,
+      width = 8,
+      height = 6
+    )
+  }
+
+  message("Comparison plot saved to ", paste0(base_output, "_comparisons.pdf"))
+  save_regression_stats(comparison_data, opt$output)
+  
+  # Create profile plot if requested
+  if (opt$plot_profiles) {
+    profile_plot <- create_profile_plot(
+      reactivity_data, 
+      region_range, 
+      group_assignments,
+      opt$region_type
+    )
+    
+    if (!is.null(profile_plot)) {
+      ggsave(
+        filename = paste0(base_output, "_profiles.pdf"),
+        plot = profile_plot,
+        width = 10,
+        height = 8
+      )
+      message("Profile plot saved to ", paste0(base_output, "_profiles.pdf"))
+    }
+  }
+  
+  message("INFO: Analysis complete!")
+}
+
+# Run the main function
+tryCatch({
+  main()
+}, error = function(e) {
+  message("ERROR: ", e$message)
+  quit(status = 1)
+})
